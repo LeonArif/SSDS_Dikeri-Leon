@@ -1,0 +1,5 @@
+data/
+.venv/
+models/
+catboost_info/
+ivant/sebelas-maret-statistics-data-science-2026/
