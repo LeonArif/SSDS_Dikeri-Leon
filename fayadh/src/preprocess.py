@@ -26,6 +26,72 @@ def load_train() -> pd.DataFrame:
     return df
 
 
+def detect_and_fix_glitches(
+    df: pd.DataFrame,
+    window: int = 4,
+    mad_threshold: float = 8.0,
+    min_abs_jump: float = 0.5,
+) -> pd.DataFrame:
+    """
+    Detect and correct isolated sensor glitches in tma_mdpl (train only —
+    test has no target to clean). Only touches the training target, so
+    this carries zero leakage risk.
+
+    Flags row i as a glitch only if ALL of the following hold, using each
+    station's own local (rolling, per-station) median/MAD so the threshold
+    adapts to that station's natural scale and volatility:
+      - |value_i - local_median| is large relative to the local MAD
+        (mad_threshold x)
+      - value_i jumps by >= min_abs_jump from BOTH immediate neighbors
+      - neighbors i-1 and i+1 are close to each other (spike-and-revert
+        shape). This deliberately does NOT flag genuine flood rises
+        (e.g. Gunungsari's Nov-Dec swings), which move step-by-step and
+        stay elevated for many consecutive observations rather than
+        spiking and immediately reverting.
+
+    Flagged points are replaced with the local median (safe, local
+    imputation). Mirrors the glitch-cleaning step used in the best
+    (Leon's) submission on this dataset, which fayadh's pipeline was
+    missing entirely.
+    """
+    df = df.sort_values([STATION_COL, DATETIME_COL]).reset_index(drop=True)
+    df[TARGET_COL] = df[TARGET_COL].astype(float)
+    n_glitches = 0
+
+    for pos, g in df.groupby(STATION_COL):
+        idx = g.index.to_numpy()
+        val = df.loc[idx, TARGET_COL].to_numpy()
+        n = len(val)
+        if n < 2 * window + 3:
+            continue
+        for i in range(window, n - window):
+            if np.isnan(val[i]) or np.isnan(val[i - 1]) or np.isnan(val[i + 1]):
+                continue
+            neigh = np.concatenate([val[i - window:i], val[i + 1:i + 1 + window]])
+            neigh = neigh[~np.isnan(neigh)]
+            if len(neigh) < window:
+                continue
+            local_median = np.median(neigh)
+            mad = np.median(np.abs(neigh - local_median)) + 1e-6
+            dev = abs(val[i] - local_median)
+            jump_prev = abs(val[i] - val[i - 1])
+            jump_next = abs(val[i] - val[i + 1])
+            neighbor_gap = abs(val[i - 1] - val[i + 1])
+
+            is_glitch = (
+                dev > max(min_abs_jump, mad_threshold * mad)
+                and jump_prev > min_abs_jump
+                and jump_next > min_abs_jump
+                and neighbor_gap < 0.5 * (jump_prev + jump_next)
+            )
+            if is_glitch:
+                df.loc[idx[i], TARGET_COL] = local_median
+                n_glitches += 1
+
+    print(f"Glitch detection: corrected {n_glitches} anomalous tma_mdpl points out of {len(df)}")
+    return df
+
+
 def load_test() -> pd.DataFrame:
     """Load test.csv, parse the composite 'id' column into datetime + station."""
     df = pd.read_csv(TEST_CSV)
@@ -40,6 +106,13 @@ def load_env() -> pd.DataFrame:
     """Load data_lingkungan.csv with datetime parsed."""
     df = pd.read_csv(ENV_CSV, parse_dates=[DATETIME_COL])
     df = df.sort_values([STATION_COL, DATETIME_COL]).reset_index(drop=True)
+
+    # rainfall_openmeteo_mm is identical to rainfall_mm for every row
+    # (correlation = 1, verified exactly) -- pure duplicate that doubles
+    # every rainfall lag/rolling/cumulative feature for zero new signal.
+    if "rainfall_openmeteo_mm" in df.columns:
+        df = df.drop(columns=["rainfall_openmeteo_mm"])
+
     return df
 
 
@@ -124,56 +197,43 @@ def clean_env(env: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 def aggregate_env_to_6h(env: pd.DataFrame) -> pd.DataFrame:
     """
-    For each observation hour (06, 12, 18), aggregate environment data
-    from the preceding 6-hour window.
+    Aggregate hourly environment data into windows aligned to each
+    observation time (06:00, 12:00, 18:00), where each window spans the
+    time SINCE THE PREVIOUS OBSERVATION — not a fixed 6 hours.
 
-    For obs at hour H -> aggregate env from (H-5) to H inclusive.
-    E.g., obs at 12:00 -> aggregate env hours 07, 08, 09, 10, 11, 12.
+    TMA is only measured 3x/day, so the gap before the 06:00 reading is
+    actually 12 hours (back to 18:00 the PREVIOUS day), while the gaps
+    before the 12:00 and 18:00 readings are 6 hours each. A fixed 6-hour
+    window for every slot (the previous implementation) silently drops
+    the overnight 19:00-24:00 rainfall/weather from every single 06:00
+    reading's aggregation — a systematic error affecting 1/3 of all rows,
+    not just a few rows near data gaps.
 
     Uses SUM for rainfall/solar, MEAN for everything else.
     """
     env = env.copy()
-    env["hour"] = env[DATETIME_COL].dt.hour
-    env["date"] = env[DATETIME_COL].dt.date
+    hour = env[DATETIME_COL].dt.hour
+    date = env[DATETIME_COL].dt.normalize()
 
-    results = []
+    conditions = [hour < 6, hour < 12, hour < 18]
+    choices = [
+        date + pd.Timedelta(hours=6),
+        date + pd.Timedelta(hours=12),
+        date + pd.Timedelta(hours=18),
+    ]
+    default = date + pd.Timedelta(days=1, hours=6)
+    env["window_end"] = np.select(conditions, choices, default=default)
 
-    for station in env[STATION_COL].unique():
-        station_env = env[env[STATION_COL] == station].sort_values(DATETIME_COL)
+    agg_dict = {}
+    for feat in AGG_SUM_FEATURES:
+        if feat in env.columns:
+            agg_dict[feat] = "sum"
+    for feat in AGG_MEAN_FEATURES:
+        if feat in env.columns:
+            agg_dict[feat] = "mean"
 
-        for obs_hour in OBS_HOURS:
-            # Define the 6-hour window for each day
-            # For obs_hour=6 -> hours 1-6, obs_hour=12 -> hours 7-12, obs_hour=18 -> hours 13-18
-            start_hour = obs_hour - 5
-            end_hour = obs_hour
-
-            # Filter to relevant hours
-            mask = station_env["hour"].between(start_hour, end_hour)
-            window_data = station_env[mask].copy()
-
-            if window_data.empty:
-                continue
-
-            # Build aggregation dict
-            agg_dict = {}
-            for feat in AGG_SUM_FEATURES:
-                if feat in window_data.columns:
-                    agg_dict[feat] = "sum"
-            for feat in AGG_MEAN_FEATURES:
-                if feat in window_data.columns:
-                    agg_dict[feat] = "mean"
-
-            # Group by date and aggregate
-            grouped = window_data.groupby("date").agg(agg_dict).reset_index()
-            grouped[STATION_COL] = station
-            grouped[DATETIME_COL] = pd.to_datetime(
-                grouped["date"].astype(str) + f" {obs_hour:02d}:00:00"
-            )
-            grouped = grouped.drop(columns=["date"])
-
-            results.append(grouped)
-
-    env_agg = pd.concat(results, ignore_index=True)
+    env_agg = env.groupby([STATION_COL, "window_end"]).agg(agg_dict).reset_index()
+    env_agg = env_agg.rename(columns={"window_end": DATETIME_COL})
     env_agg = env_agg.sort_values([STATION_COL, DATETIME_COL]).reset_index(drop=True)
 
     print(f"Aggregated env: {env_agg.shape}")
@@ -256,6 +316,18 @@ def extract_river_features(river_gdf, coord: pd.DataFrame) -> pd.DataFrame:
         if "ORD_STRA" in river_gdf.columns:
             result["river_strahler"] = river_gdf.iloc[indices]["ORD_STRA"].values
 
+        # main_river_id / hydrobasin_id come from HydroRIVERS as huge raw
+        # integer codes (hydrobasin_id ~5.12e9, past int32 max 2.15e9).
+        # LightGBM's categorical handling casts category codes to int32,
+        # so hydrobasin_id silently overflows to negative and gets dropped
+        # to NaN for every single row ("Met negative value in categorical
+        # features" warning) -- the feature was pure noise for LightGBM.
+        # Factorize to small dense codes (only ~30 stations / a handful of
+        # rivers & basins here) so the category identity survives intact.
+        for id_col in ("main_river_id", "hydrobasin_id"):
+            if id_col in result.columns:
+                result[id_col] = pd.factorize(result[id_col])[0]
+
         print(f"River features extracted for {len(result)} stations.")
         return result
 
@@ -308,6 +380,52 @@ def build_spatial_features(coord: pd.DataFrame, river_features: pd.DataFrame) ->
 
 
 # ============================================================
+# 5b. Dense 6-hourly grid reindex (CRITICAL — see docstring)
+# ============================================================
+def reindex_dense_grid(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reindex to a complete 6-hourly grid (obs hours 06/12/18) per station,
+    inserting explicit rows for any missing timestamp (marked _observed=0).
+
+    train.csv/test.csv have substantial real gaps: most stations are
+    missing hundreds of expected 6-hourly observations, and several
+    stations have gaps spanning multiple WEEKS (e.g. Floodway Bridge C
+    has a 163-day gap; most stations have a shared ~25-day gap around
+    Feb 2025). Without this step, a plain groupby().shift(n)/rolling(n)
+    silently treats consecutive ROWS as if they were exactly n*6 hours
+    apart, regardless of the true calendar gap between them — corrupting
+    every lag/rolling/cumulative/API feature computed across a gap
+    (not just at CV fold boundaries, but throughout the whole dataset).
+    Reindexing first makes shift/rolling operate on true calendar time;
+    the synthetic gap-filler rows are dropped again after feature
+    engineering (see drop_phantom_rows).
+    """
+    frames = []
+    for pos, g in df.groupby(STATION_COL):
+        full_range = pd.date_range(g[DATETIME_COL].min(), g[DATETIME_COL].max(), freq="6h")
+        full_range = full_range[full_range.hour.isin(OBS_HOURS)]
+        frames.append(pd.DataFrame({STATION_COL: pos, DATETIME_COL: full_range}))
+    grid = pd.concat(frames, ignore_index=True)
+
+    merged = grid.merge(df, on=[STATION_COL, DATETIME_COL], how="left", indicator=True)
+    merged["_observed"] = (merged["_merge"] == "both").astype(int)
+    merged = merged.drop(columns=["_merge"])
+    merged = merged.sort_values([STATION_COL, DATETIME_COL]).reset_index(drop=True)
+
+    n_phantom = int((merged["_observed"] == 0).sum())
+    print(f"Dense grid reindex: {len(df)} -> {len(merged)} rows "
+          f"({n_phantom} phantom/gap-filler rows added for correct lag/rolling spacing)")
+    return merged
+
+
+def drop_phantom_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop the synthetic gap-filler rows added by reindex_dense_grid, after
+    features have been computed on the dense grid."""
+    out = df[df["_observed"] == 1].drop(columns=["_observed"]).reset_index(drop=True)
+    return out
+
+
+# ============================================================
 # 6. Merge into master dataset
 # ============================================================
 def merge_master(
@@ -337,16 +455,43 @@ def merge_master(
 
 
 # ============================================================
-# 7. Full preprocessing pipeline
+# 7. Split combined dataframe back into train/test after feature engineering
+# ============================================================
+def split_train_test(df: pd.DataFrame) -> tuple:
+    """
+    Drop phantom (gap-filler) rows and split the combined dataframe back
+    into train and test portions using the `_source` marker set in
+    run_preprocessing(). Call this AFTER feature engineering has been run
+    once on the full combined dataframe.
+    """
+    df = drop_phantom_rows(df)
+    master_train = df[df["_source"] == "train"].drop(columns=["_source"]).reset_index(drop=True)
+    master_test = df[df["_source"] == "test"].drop(columns=["_source"]).reset_index(drop=True)
+    return master_train, master_test
+
+
+# ============================================================
+# 8. Full preprocessing pipeline
 # ============================================================
 def run_preprocessing():
     """
-    Full pipeline: load -> clean -> aggregate -> extract spatial -> merge.
+    Full pipeline: load -> clean -> combine train+test -> reindex to a
+    dense gap-free 6-hourly grid -> merge env/spatial features.
+
+    Train and test are combined and reindexed together BEFORE any lag/
+    rolling feature is computed, and BEFORE the env/spatial merge, so that
+    (a) shift/rolling operations always operate on true calendar-spaced
+    rows even across the many real gaps in train.csv/test.csv (see
+    reindex_dense_grid), and (b) feature history carries correctly across
+    the train/test boundary without a separate concat step later.
 
     Returns
     -------
-    master_train : pd.DataFrame
-    master_test  : pd.DataFrame
+    master_combined : pd.DataFrame
+        Single combined dataframe with `_source` ("train"/"test") and
+        `_observed` (1 = real row, 0 = phantom gap-filler) markers.
+        Run feature engineering on this ONCE, then call split_train_test()
+        to get the final master_train / master_test matrices.
     """
     # Load
     data = load_all_data()
@@ -355,6 +500,11 @@ def run_preprocessing():
     env = data["env"]
     coord = data["coord"]
     river = data["river"]
+
+    # Clean target (train only — sensor glitches inflate RMSE disproportionately
+    # since errors are squared; test has no target so nothing to clean there)
+    print("\nCleaning target (glitch detection)...")
+    train = detect_and_fix_glitches(train)
 
     # Clean env
     print("\nCleaning environment data...")
@@ -372,12 +522,24 @@ def run_preprocessing():
     print("\nBuilding spatial features...")
     spatial = build_spatial_features(coord, river_features)
 
-    # Merge
-    print("\nMerging master train...")
-    master_train = merge_master(train, env_agg, spatial)
+    # Combine train + test BEFORE reindexing/gap-filling, so lag/rolling
+    # history is continuous and correctly calendar-spaced across the
+    # train/test boundary too.
+    train = train.copy()
+    test = test.copy()
+    train["_source"] = "train"
+    test["_source"] = "test"
+    if TARGET_COL not in test.columns:
+        test[TARGET_COL] = np.nan
 
-    print("\nMerging master test...")
-    master_test = merge_master(test, env_agg, spatial)
+    combined = pd.concat([train, test], ignore_index=True, sort=False)
+    combined = combined.sort_values([STATION_COL, DATETIME_COL]).reset_index(drop=True)
 
-    return master_train, master_test
+    print("\nReindexing to dense 6-hourly grid (fills real data gaps)...")
+    combined = reindex_dense_grid(combined)
+
+    print("\nMerging environment + spatial features onto dense grid...")
+    combined = merge_master(combined, env_agg, spatial)
+
+    return combined
 

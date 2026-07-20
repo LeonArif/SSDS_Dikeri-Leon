@@ -145,19 +145,26 @@ def reduce_mem_usage(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
     return df
 
 
-def plot_learning_curves(evals_results: list, model_name: str):
+def plot_learning_curves(evals_results: list, model_name: str, show: bool = True):
     """
     Plot train vs validation loss across all CV folds.
-    
+
     Parameters
     ----------
     evals_results : list
         List of eval_result dictionaries from each model fold.
     model_name : str
         Name of the model (e.g. 'lightgbm').
+    show : bool
+        If True, call plt.show() (only safe in an interactive/notebook
+        session — a GUI matplotlib backend running headless, e.g. in a
+        background/scripted job, will block forever waiting for a window
+        that nobody can close). Set False for scripted/background runs;
+        the figure is always saved to OUTPUT_DIR regardless.
     """
+    import matplotlib
     import matplotlib.pyplot as plt
-    
+
     if not evals_results or evals_results[0] is None:
         print("No evaluation results available to plot.")
         return
@@ -189,5 +196,12 @@ def plot_learning_curves(evals_results: list, model_name: str):
     axes[0].set_ylabel("RMSE")
     plt.suptitle(f"{model_name.upper()} Learning Curves", y=1.05)
     plt.tight_layout()
-    plt.show()
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    fig.savefig(OUTPUT_DIR / f"learning_curves_{model_name}.png", dpi=100)
+
+    if show and matplotlib.get_backend().lower() != "agg":
+        plt.show()
+    else:
+        plt.close(fig)
 
